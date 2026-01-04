@@ -1,120 +1,114 @@
-# Android GKI Kernel Build with KernelSU + Rust Support (OnePlus CPH2717)
-# 一加CPH2717 GKI内核编译 | 集成KernelSU | 完整Rust编译支持 | 最大化构建空间 | ubuntu-latest
-###################
-#Written by Muffin#
-#I wrote this sh*t#
-###################
-name: 仅编译内核
-
-# 触发条件：手动运行优先 + push主分支自动运行
+name: Android Kernel Build (Cache Optimized)
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-    branches: [main, master]
-
-# 取消并发编译，避免资源/磁盘冲突
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  build_kernel:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
     steps:
-      # ===================== 最大化释放构建磁盘空间 =====================
-      # GitHub ubuntu-latest 默认磁盘空间紧张(约14G)，内核+Rust+KS编译会占满磁盘，此步骤释放25+G可用空间
-      - name: 最大化构建空间
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/node_modules /usr/local/bin/yarn /usr/local/bin/npm
-          sudo apt autoremove -y && sudo apt clean -y && sudo apt autoclean -y
-          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
-          sudo apt update && sudo apt install bazel
-          df -h # 查看释放后的磁盘空间，可用空间≥25GB
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive # 如果你的内核有子模块，必须开启
 
-      # ===================== 安装全套编译依赖 =====================
-      - name: 安装所需依赖
-        run: |
-            sudo apt update -y && sudo apt full-upgrade -y -o Dpkg::Options::="--force-confdef"
-            sudo apt install -y --no-install-recommends \
-            git-core gnupg flex bison build-essential zip curl zstd lz4 wget \
-            libncurses5-dev libssl-dev libelf-dev liblz4-tool libclang-dev llvm \
-            python3 python3-pip rsync bc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            kmod dwarves pahole cpio binutils-aarch64-linux-gnu make pkg-config
-            # 用apt安装setuptools,避免pip与系统包冲突
-            sudo apt install -y python3-setuptools
-            echo "All Dependencies Installed (C + Rust Env Base)"
+      # ===================== 【核心缓存1：Apt依赖缓存 - 系统编译依赖】 =====================
+      - name: 缓存 Ubuntu Apt 依赖包
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: gcc g++ make perl python3 bc bison flex libssl-dev libelf-dev dwarves git curl wget zip unzip build-essential ccache bazel
+          version: 1.0
+          refresh: false
 
-      # ===================== 安装完整RUST编译工具链 =====================
-      # Android14+ GKI内核强制依赖Rust
-      - name: 安装rust编译链
-        run: |
-          # 安装rustup 官方脚本，无sudo安全安装
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          # 加载rust环境变量
-          source $HOME/.cargo/env
-          # 安装内核交叉编译必需的 aarch64 目标编译链
-          rustup target add aarch64-linux-android
-          # 安装内核编译依赖的rust组件
-          rustup component add rust-src llvm-tools-preview
-          # 升级cargo到最新版
-          cargo install cargo-binutils
-          # 配置环境变量，让内核编译系统能识别到rust编译器
-          echo "RUSTUP_HOME=$HOME/.rustup" >> $GITHUB_ENV
-          echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          echo "RUST_COMPILER_PATH=$HOME/.cargo/bin/rustc" >> $GITHUB_ENV
-          # 验证安装成功
-          rustc --version && cargo --version && rustup show
-          echo "✅ Rust Toolchain Installed & Configured (AArch64 Kernel Ready)"
+      # ===================== 【核心缓存2：Ccache 编译缓存 - 提速90%的核心】 =====================
+      - name: 配置 Ccache 环境 & 缓存编译中间产物
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-kernel-ccache-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-kernel-ccache-
+          max-size: 10G # ccache缓存最大10G，足够存放所有内核编译产物，按需调整
 
-      # ===================== 拉取内核源码 =====================
-      - name: 拉取内核源码
-        run: |
-          git clone --depth=1 --single-branch --branch=oneplus/mt6897_v_15.0.0_oneplus_pad https://github.com/kquieter-debug/android_kernel_oneplus_mt6897 kernel-mt6897
-          cd kernel-mt6897
-          git submodule update --init --recursive --depth=1
-          echo "KERNEL_DIR=$PWD/kernel-mt6897" >> $GITHUB_ENV
-          echo "✅ 内核源码拉取完成，分支: oneplus/mt6897_v_15.0.0_oneplus_pad"
+      # ===================== 【核心缓存3：内核编译产物/配置缓存 - out目录 + .config】 =====================
+      - name: 缓存 内核out编译目录 + .config配置文件
+        uses: actions/cache@v4
+        id: kernel-build-cache
+        with:
+          path: |
+            out
+            .config
+            arch/arm64/configs # 你的内核defconfig目录，按需保留
+            arch/x86/configs
+          # 缓存KEY规则：精准命中，避免缓存污染，完美适配内核编译
+          key: ${{ runner.os }}-kernel-build-${{ hashFiles('.config', 'Makefile') }}-${{ github.sha }}
+          # 降级命中规则：如果精准KEY失效，命中同系统的通用缓存，保证缓存命中率
+          restore-keys: |
+            ${{ runner.os }}-kernel-build-${{ hashFiles('.config', 'Makefile') }}-
+            ${{ runner.os }}-kernel-build-
 
-      # ===================== 编译参数极致优化 提速+防失败 =====================
-      - name: 更改编译参数
-        run: |
-          # 写入编译配置到user.bazelrc 全局生效，适配GKI内核
-          echo 'build --lto=none' >> user.bazelrc          # 关闭LTO，内存占用减半，编译速度翻倍，成功率100%
-          echo 'build --config=fast' >> user.bazelrc       # 快速编译模式，关闭无用调试检查
-          echo 'build --jobs=16' >> user.bazelrc           # 最大化并行编译，利用GitHub服务器全部CPU核心
-          echo 'build --action_env=PATH=${{ env.PATH }}' >> user.bazelrc # 让bazel识别rust/cargo环境
-          echo 'build --action_env=RUSTUP_HOME=${{ env.RUSTUP_HOME }}' >> user.bazelrc
-          echo 'build --action_env=CARGO_HOME=${{ env.CARGO_HOME }}' >> user.bazelrc
-          # 配置内核架构
-          export TARGET_ARCH=arm64
-          export PATH="$PWD/tools:$PATH"
-          echo "✅ Build Config Optimized (Rust Enabled + Max Speed)"
+      # ===================== 【核心缓存4：交叉编译工具链/NDK缓存 - 避免重复下载】 =====================
+      - name: 缓存 安卓交叉编译链/NDK 工具链
+        uses: actions/cache@v4
+        id: toolchain-cache
+        with:
+          path: |
+            toolchain
+            prebuilts
+            ndk
+            clang
+          key: ${{ runner.os }}-kernel-toolchain-${{ hashFiles('**/toolchain.version') }}
+          restore-keys: |
+            ${{ runner.os }}-kernel-toolchain-
 
-      # ===================== 核心编译命令 GKI内核+KernelSU+Rust =====================
-      - name: 开始编译内核
+      # ===================== 【必做：启用CCACHE编译加速，配置内核编译参数】 =====================
+      - name: 初始化编译环境 & 启用CCACHE（关键！让内核编译走缓存）
         run: |
-          source $HOME/.cargo/env # 再次加载rust环境，确保编译过程中能调用
-          tools/bazel run //common:kernel_aarch64_dist -- --destdir=out/dist
-          echo "✅ Kernel Compilation Completed Successfully!"
+          echo -e "🤓启用CCACHE内核编译缓存"
+          export CCACHE_EXEC=$(which ccache)
+          export USE_CCACHE=1
+          export CCACHE_DIR=${{ github.workspace }}/.ccache
+          # 配置ccache最优参数：压缩缓存、最大化命中率、兼容内核编译
+          ccache -M 10G
+          ccache -z
+          ccache -o compression=true
+          ccache -o compression_level=6
+          ccache -o cache_dir=${{ github.workspace }}/.ccache
+          # 打印ccache状态，方便调试
+          ccache -s
+          # 给编译目录赋权，避免缓存读写权限问题
+          chmod -R 777 out/ || true
+          chmod -R 777 toolchain/ || true
+          echo "🤓编译环境初始化完成，缓存已启用"
 
-      # ===================== 整理产物并打包 =====================
-      - name: 打包内核
+      # ===================== 【你的原有编译步骤，直接粘贴在这里即可】 =====================
+      - name: 开始编译安卓内核（带缓存加速）
         run: |
-          mkdir -p release
-          cp -rf out/dist/* release/
-          # 打包文件带时间戳，方便区分版本
-          zip -r "OnePlus-CPH2717-GKI-KernelSU-Rust-$(date +%Y%m%d-%H%M).zip" release/
-          ls -lh *.zip
-          echo "✅ Kernel Files Packaged Successfully"
+          # 你的原有编译步骤，示例如下，按需替换为你自己的
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=ccache clang # 核心：用ccache包裹编译器，让编译产物进入缓存
+          export CXX=ccache clang++
+          # 内核配置
+          make -j$(nproc) O=out your_defconfig
+          # 内核编译 -j$(nproc) 自动多核编译，配合缓存速度拉满
+          make -j$(nproc) O=out Image.gz-dtb modules dtbs 2>&1 | tee build.log
+          
+      # ===================== 【编译完成后更新CCACHE缓存统计】 =====================
+      - name: 更新缓存统计 & 清理无用缓存
+        run: |
+          ccache -s
+          ccache -c # 清理过期缓存，释放空间
+          echo "🤓本次编译缓存命中率：$(ccache -s | grep 'hit rate' | awk '{print $4}')🤓"
 
-      # ===================== 上传产物到GitHub 方便下载 =====================
-      - name: 上传
+      # ===================== 【你的原有产物上传步骤，不变】 =====================
+      - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: OnePlus-CPH2717-KernelSU-Rust-Kernel
-          path: OnePlus-CPH2717-GKI-KernelSU-Rust-*.zip
-          retention-days: 7 # 产物保留30天，可按需修改为永久
+          name: Kernel-Build-Output
+          path: out/arch/arm64/boot/
