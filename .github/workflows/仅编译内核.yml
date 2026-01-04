@@ -1,114 +1,150 @@
-name: Android Kernel Build (Cache Optimized)
+name: OnePlus MT6897 Kernel Build (A15 | Rust | Cache Full Optimized)
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: # 手动触发编译，必备
 
 jobs:
-  build:
+  build_kernel:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: 检出内核源码
+      # ========== 【核心第一步：精准拉取你的MT6897内核源码】 ==========
+      - name: 检出 一加MT6897 内核源码 (你的独立仓库)
         uses: actions/checkout@v4
         with:
+          repository: kquieter-debug/android_kernel_oneplus_mt6897 # 你的源码仓库地址
+          ref: oneplus/mt6897_v_15.0.0_oneplus_pad # 你的内核源码分支，精准匹配
           fetch-depth: 1
-          submodules: recursive # 如果你的内核有子模块，必须开启
+          submodules: recursive # 你的源码有子模块，必须开启，防止编译缺失文件
 
-      # ===================== 【核心缓存1：Apt依赖缓存 - 系统编译依赖】 =====================
-      - name: 缓存 Ubuntu Apt 依赖包
+      # ========== 【缓存1：Ubuntu系统依赖包 无废弃参数 修复Bazel报错】 ==========
+      - name: 缓存 & 安装系统编译依赖
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: gcc g++ make perl python3 bc bison flex libssl-dev libelf-dev dwarves git curl wget zip unzip build-essential ccache bazel
+          packages: gcc g++ make perl python3 bc bison flex libssl-dev libelf-dev dwarves git curl wget zip unzip build-essential ccache rsync
           version: 1.0
-          refresh: false
 
-      # ===================== 【核心缓存2：Ccache 编译缓存 - 提速90%的核心】 =====================
-      - name: 配置 Ccache 环境 & 缓存编译中间产物
+      # ========== 【修复Bazel：独立安装官方版 解决找不到包问题】 ==========
+      - name: 安装 Bazel 编译工具 (内核A15必备)
+        run: |
+          curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor > bazel.gpg
+          sudo mv bazel.gpg /etc/apt/trusted.gpg.d/
+          echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" | sudo tee /etc/apt/sources.list.d/bazel.list
+          sudo apt update && sudo apt install -y bazel
+
+      # ========== 【缓存2：Rust编译链缓存 A15内核强制依赖 重中之重】 ==========
+      - name: 缓存 Rust 编译链 (.cargo + .rustup)
+        uses: actions/cache@v4
+        id: rust-cache
+        with:
+          path: |
+            ~/.cargo
+            ~/.rustup
+          key: ${{ runner.os }}-mt6897-rust-${{ hashFiles('**/rust-version.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-mt6897-rust-
+
+      # ========== 【安装Rust编译链 内核A15必备组件 完整无缺】 ==========
+      - name: 安装 Rust 环境 + A15内核强制依赖组件
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source $HOME/.cargo/env
+          rustup component add rust-src llvm-tools-preview rustfmt clippy
+          cargo install bindgen-cli
+          rustc --version && cargo --version
+
+      # ========== 【缓存3：CCache核心缓存 提速90% 内核编译的灵魂】 ==========
+      - name: 配置 CCache 编译缓存 (C/C+++Rust双缓存)
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ runner.os }}-kernel-ccache-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-kernel-ccache-
-          max-size: 10G # ccache缓存最大10G，足够存放所有内核编译产物，按需调整
+          key: ${{ runner.os }}-mt6897-ccache-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-mt6897-ccache-
+          max-size: 15G # 给足缓存空间，MT6897内核编译产物大，15G刚好
 
-      # ===================== 【核心缓存3：内核编译产物/配置缓存 - out目录 + .config】 =====================
-      - name: 缓存 内核out编译目录 + .config配置文件
+      # ========== 【缓存4：内核编译产物+配置缓存 out目录+defconfig+.config】 ==========
+      - name: 缓存 内核编译产物 & 配置文件
         uses: actions/cache@v4
         id: kernel-build-cache
         with:
           path: |
             out
             .config
-            arch/arm64/configs # 你的内核defconfig目录，按需保留
-            arch/x86/configs
-          # 缓存KEY规则：精准命中，避免缓存污染，完美适配内核编译
-          key: ${{ runner.os }}-kernel-build-${{ hashFiles('.config', 'Makefile') }}-${{ github.sha }}
-          # 降级命中规则：如果精准KEY失效，命中同系统的通用缓存，保证缓存命中率
+            arch/arm64/configs
+            arch/arm64/boot/dts
+          key: ${{ runner.os }}-mt6897-build-${{ hashFiles('.config', 'Makefile', 'arch/arm64/configs/*defconfig') }}
           restore-keys: |
-            ${{ runner.os }}-kernel-build-${{ hashFiles('.config', 'Makefile') }}-
-            ${{ runner.os }}-kernel-build-
+            ${{ runner.os }}-mt6897-build-
 
-      # ===================== 【核心缓存4：交叉编译工具链/NDK缓存 - 避免重复下载】 =====================
-      - name: 缓存 安卓交叉编译链/NDK 工具链
+      # ========== 【缓存5：你的源码自带编译工具链缓存 无需重复下载解压】 ==========
+      - name: 缓存 内核自带交叉编译链 (prebuilts) 核心！！！
         uses: actions/cache@v4
         id: toolchain-cache
         with:
           path: |
-            toolchain
             prebuilts
-            ndk
             clang
-          key: ${{ runner.os }}-kernel-toolchain-${{ hashFiles('**/toolchain.version') }}
+            gcc
+          key: ${{ runner.os }}-mt6897-toolchain-${{ hashFiles('prebuilts/**/version') }}
           restore-keys: |
-            ${{ runner.os }}-kernel-toolchain-
+            ${{ runner.os }}-mt6897-toolchain-
 
-      # ===================== 【必做：启用CCACHE编译加速，配置内核编译参数】 =====================
-      - name: 初始化编译环境 & 启用CCACHE（关键！让内核编译走缓存）
+      # ========== 【初始化编译环境 加载所有依赖+配置最优编译参数】 ==========
+      - name: 初始化 MT6897 编译环境 (加载Rust+CCache+内核参数)
         run: |
-          echo -e "🤓启用CCACHE内核编译缓存"
+          echo -e "✅ 初始化一加MT6897内核编译环境 [Android 15 | ARM64 | Rust Enabled]"
+          # 加载Rust环境变量 必须加载 否则内核找不到rustc
+          source $HOME/.cargo/env
+          # 核心CCache配置 双缓存C/C++和Rust
           export CCACHE_EXEC=$(which ccache)
           export USE_CCACHE=1
           export CCACHE_DIR=${{ github.workspace }}/.ccache
-          # 配置ccache最优参数：压缩缓存、最大化命中率、兼容内核编译
-          ccache -M 10G
-          ccache -z
-          ccache -o compression=true
-          ccache -o compression_level=6
-          ccache -o cache_dir=${{ github.workspace }}/.ccache
-          # 打印ccache状态，方便调试
-          ccache -s
-          # 给编译目录赋权，避免缓存读写权限问题
-          chmod -R 777 out/ || true
-          chmod -R 777 toolchain/ || true
-          echo "🤓编译环境初始化完成，缓存已启用"
-
-      # ===================== 【你的原有编译步骤，直接粘贴在这里即可】 =====================
-      - name: 开始编译安卓内核（带缓存加速）
-        run: |
-          # 你的原有编译步骤，示例如下，按需替换为你自己的
+          export CCACHE_MAXSIZE=15G
+          export RUSTC_WRAPPER=ccache
+          export CARGO_INCREMENTAL=1
+          # CCache最优参数 提高命中率
+          ccache -M 15G && ccache -z && ccache -o compression=true -o compression_level=6
+          # 内核编译核心环境变量
           export ARCH=arm64
           export SUBARCH=arm64
+          export KBUILD_BUILD_USER=kquieter
+          export KBUILD_BUILD_HOST=github-actions
+          # 目录权限修复 防止编译权限报错
+          chmod -R 777 out/ prebuilts/ scripts/ || true
+          chmod -R +x scripts/ || true
+          # 打印环境信息 方便调试
+          ccache -s && rustc --version && bazel --version
+          echo -e "✅ 编译环境初始化完成"
+
+      # ========== 【核心编译步骤 适配你的MT6897内核 无需修改】 ==========
+      - name: 编译 一加MT6897 内核 (Android 15 | 带Rust模块)
+        run: |
+          # 加载依赖环境
+          source $HOME/.cargo/env
+          export ARCH=arm64
+          export SUBARCH=arm64
+          # 调用你源码自带的交叉编译链 精准匹配
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=ccache clang # 核心：用ccache包裹编译器，让编译产物进入缓存
+          export CC=ccache clang
           export CXX=ccache clang++
-          # 内核配置
-          make -j$(nproc) O=out your_defconfig
-          # 内核编译 -j$(nproc) 自动多核编译，配合缓存速度拉满
+          # 生成内核配置 (你的MT6897内核defconfig，通用名，无需修改)
+          make -j$(nproc) O=out vendor/mt6897_defconfig
+          # 编译内核核心产物 Image.gz-dtb+模块+设备树 适配你的平板
           make -j$(nproc) O=out Image.gz-dtb modules dtbs 2>&1 | tee build.log
-          
-      # ===================== 【编译完成后更新CCACHE缓存统计】 =====================
-      - name: 更新缓存统计 & 清理无用缓存
+
+      # ========== 【缓存统计 查看命中率 清理无用缓存】 ==========
+      - name: 编译完成 - 缓存统计
         run: |
           ccache -s
-          ccache -c # 清理过期缓存，释放空间
-          echo "🤓本次编译缓存命中率：$(ccache -s | grep 'hit rate' | awk '{print $4}')🤓"
+          echo "✅ 本次编译CCache命中率: $(ccache -s | grep 'hit rate' | awk '{print $4}')"
+          ccache -c && ccache -z
 
-      # ===================== 【你的原有产物上传步骤，不变】 =====================
-      - name: 上传编译产物
+      # ========== 【上传编译产物 精准指向你的内核镜像路径】 ==========
+      - name: 上传 MT6897 内核编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-Build-Output
-          path: out/arch/arm64/boot/
+          name: OnePlus-MT6897-Kernel-A15
+          path: |
+            out/arch/arm64/boot/Image.gz-dtb
+            out/arch/arm64/boot/dts/
+            out/*.ko
