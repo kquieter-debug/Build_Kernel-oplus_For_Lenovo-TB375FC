@@ -31,6 +31,7 @@ jobs:
           sudo rm -rf /usr/local/lib/node_modules /usr/local/bin/yarn /usr/local/bin/npm
           sudo apt autoremove -y && sudo apt clean -y && sudo apt autoclean -y
           sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+          sudo apt update && sudo apt install bazel
           df -h # 查看释放后的磁盘空间，可用空间≥25GB
 
       # ===================== 安装全套编译依赖 =====================
