@@ -125,8 +125,8 @@ jobs:
           export SUBARCH=arm64
           # 调用你源码自带的交叉编译链 精准匹配
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=ccache clang
-          export CXX=ccache clang++
+          export CC="ccache clang"
+          export CXX="ccache clang++"
           # 生成内核配置 (你的MT6897内核defconfig，通用名，无需修改)
           make -j$(nproc) O=out vendor/mt6897_defconfig
           # 编译内核核心产物 Image.gz-dtb+模块+设备树 适配你的平板
